@@ -1,0 +1,16 @@
+{
+  "name": "yt-grab",
+  "version": "1.0.0",
+  "description": "Fast, polished YouTube downloader web app",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "archiver": "^8.0.0",
+    "express": "^4.19.2",
+    "node-id3": "^0.2.9"
+  }
+}
