@@ -1,7 +1,7 @@
 {
   "name": "yt-grab",
   "version": "1.0.0",
-  "description": "Fast, polished YouTube downloader web app",
+  "description": "Multi-source media downloader — paste a link, pick a format, grab it",
   "main": "server.js",
   "type": "module",
   "scripts": {

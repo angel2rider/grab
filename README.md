@@ -62,6 +62,7 @@ Copy `.env.example` to `.env` and configure:
 ```
 grab/
 ├── server.js                  # Express app: CORS, routes, rate-limit, graceful shutdown
+├── .env.example               # Environment variable template (copy to .env)
 ├── ecosystem.config.cjs       # PM2 process config (auto-restart, log rotation, memory limits)
 ├── wrangler.toml              # Cloudflare Pages deployment config
 ├── package.json               # Dependencies & scripts

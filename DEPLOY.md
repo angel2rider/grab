@@ -147,8 +147,7 @@ Cache-busts: `index.html` is `Cache-Control: max-age=0`, so it's always fresh. `
 Whenever you change `server.js`:
 
 ```bash
-fuser -k 3000/tcp 2>/dev/null; sleep 2
-cd /root/grab && node server.js > /tmp/grab-server.log 2>&1 & disown
+pm2 restart grab-server
 ```
 
 ---
