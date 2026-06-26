@@ -1,122 +1,170 @@
-# grab
+# Grab
 
-A fast, polished **multi-source** media downloader that runs locally. Paste a link from almost anywhere — video platforms, social media, or streaming services — pick a format, grab it.
+A fast, polished **multi-source media downloader** — paste a link, pick a format, grab it. Built as a split-architecture web app: a vanilla JS frontend on Cloudflare Pages + a Node.js/Express backend on a VPS behind Cloudflare Tunnel.
 
-Built with Node.js + Express wrapping [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and `ffmpeg`. No database, no cloud — nothing is stored after you download.
+## Architecture
 
-## What it can grab
+```
+┌──────────────────────────────────────┐         ┌───────────────────────────────────┐
+│  Cloudflare Pages                    │         │  CF Tunnel → VPS (this repo)       │
+│  grab.msedge.lol  ·  static only     │ ──HTTPS──▶  grab-api.msedge.lol  ·  API      │
+│  public/index.html + app.js + boids  │         │  Express on 127.0.0.1:3000         │
+└──────────────────────────────────────┘         └───────────────────────────────────┘
+             ↳ No build step                          ↳ CORS-locked to grab.msedge.lol
+             ↳ Cache-busted via ?v=N                  ↳ PM2-managed, auto-restart
+```
 
-### Direct sources (full quality, native streams via yt-dlp)
+The frontend is pure HTML/CSS/JS — no frameworks, no build step. The backend uses yt-dlp + ffmpeg for downloads, better-sqlite3 for caching, sharp for palette extraction, express-rate-limit for abuse prevention, and PM2 for process management.
 
-Any site yt-dlp supports — that's 1000+ platforms:
+## What it can download
 
-- **YouTube** — videos, playlists (→ ZIP), audio extraction
-- **Vimeo**, **Dailymotion**, **Twitch**, **Reddit**
-- **Instagram**, **TikTok**, **X/Twitter**, **Facebook** *(some require cookies — see Notes)*
-- **SoundCloud**, **Bandcamp**, **YouTube Music**
-- …and many more. Just paste the URL.
+### Direct sources (full quality via yt-dlp — 1000+ sites)
+**YouTube** (video, audio, playlists → ZIP), **Vimeo**, **Dailymotion**, **Twitch**, **Reddit**, **Instagram**, **TikTok**, **X/Twitter**, **Facebook**, **SoundCloud**, **Bandcamp**, **YouTube Music**, and hundreds more.
 
-### Match sources (metadata → YouTube audio, tagged)
+### Match sources (DRM services → metadata-matched YouTube audio, ID3-tagged)
+**Spotify**, **Apple Music**, **Tidal**, **Qobuz**. These services use DRM, so playable audio can't be pulled directly. Instead, public metadata is read, the best YouTube match is found (by ISRC or artist+title), that audio is downloaded, and ID3 tags + album art are embedded — same approach as spotDL.
 
-Streaming services use DRM, so playable audio can't be pulled from them directly. Instead, this app reads the track's public metadata, finds the best match on YouTube, downloads that audio, and tags it with the original metadata (title, artist, album, artwork) — the same approach [spotDL](https://github.com/spotDL/spotify-downloader) uses.
+> **Limitation:** Match quality depends on YouTube availability. Rare tracks may not be found. Audio quality is YouTube's, not the streaming service's native quality.
 
-- **Spotify** — tracks work out of the box (oEmbed). Albums/playlists need API credentials (below).
-- **Apple Music** — songs resolve via the iTunes Lookup API (no auth needed).
-- **Tidal** / **Qobuz** — tracks with a name in the URL resolve via Deezer's search API.
+## Quick Start
 
-> **Honest limitation:** match quality depends on YouTube availability. Rare or region-locked tracks may not be found. Matched audio is YouTube quality, not the streaming service's native quality.
-
-## Prerequisites
-
-You need these installed and on your `PATH`:
-
-- **Node.js** 18+ (tested on v26)
-- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — `brew install yt-dlp`
-- **[ffmpeg](https://ffmpeg.org/)** — `brew install ffmpeg`
-
-## Run
+**Prerequisites:** Node.js 18+, [yt-dlp](https://github.com/yt-dlp/yt-dlp), [ffmpeg](https://ffmpeg.org/)
 
 ```bash
 npm install
-npm start
+cp .env.example .env   # edit with your values
+npm start              # http://localhost:3000
 ```
 
-Then open **http://localhost:3000**.
-
-Configuration via environment variables:
-
-```bash
-PORT=8080 \
-YT_DLP=/usr/local/bin/yt-dlp \
-FFMPEG_LOCATION=/opt/homebrew/bin \
-npm start
-```
-
-For live reload during development:
-
+For development with live reload:
 ```bash
 npm run dev
 ```
 
-### Optional: Spotify albums & playlists
+## Environment Variables
 
-Single Spotify tracks work with no setup. To resolve full albums and playlists, create a free app at [developer.spotify.com](https://developer.spotify.com/dashboard) and set:
+Copy `.env.example` to `.env` and configure:
 
-```bash
-SPOTIFY_CLIENT_ID=your_id \
-SPOTIFY_CLIENT_SECRET=your_secret \
-npm start
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | Express server port |
+| `YT_DLP` | `yt-dlp` | Path to yt-dlp binary |
+| `YT_DLP_JS_RUNTIME` | `node` | JS runtime for yt-dlp's EJS challenge solver (Node v22+, Deno) |
+| `FFMPEG_LOCATION` | auto-detected | Directory containing ffmpeg binary |
+| `COOKIES_FILE` | `./cookies.txt` | Netscape-format cookies for auth-gated sites (Instagram/TikTok) |
+| `SPOTIFY_CLIENT_ID` | — | Spotify Web API client ID (optional, for albums/playlists) |
+| `SPOTIFY_CLIENT_SECRET` | — | Spotify Web API client secret |
+| `CLOUDFLARE_API_TOKEN` | — | CF API token with Pages:Edit scope (for `wrangler pages deploy`) |
+| `CLOUDFLARE_ACCOUNT_ID` | — | CF Account ID for Pages deployment |
+
+## Project Structure
+
+```
+grab/
+├── server.js                  # Express app: CORS, routes, rate-limit, graceful shutdown
+├── ecosystem.config.cjs       # PM2 process config (auto-restart, log rotation, memory limits)
+├── wrangler.toml              # Cloudflare Pages deployment config
+├── package.json               # Dependencies & scripts
+├── .env.example               # Template for environment variables
+├── .gitignore                 # Ignores node_modules, downloads, data, .env, logs
+│
+├── lib/
+│   ├── detect.js              # URL classifier (direct vs match), platform detection
+│   ├── ytdlp.js               # yt-dlp wrapper: info extraction, format grouping, downloads
+│   ├── cache.js               # SQLite-backed URL response cache (better-sqlite3, WAL mode)
+│   ├── search.js              # YouTube Music search by ISRC or artist+title
+│   ├── archive.js             # Batch download → ZIP archive on disk
+│   ├── tagging.js             # ID3 tag embedding (title, artist, album, artwork)
+│   └── matchers/
+│       ├── index.js           # Routes match sources to platform-specific resolvers
+│       ├── spotify.js         # Spotify Web API + oEmbed fallback
+│       ├── appleMusic.js      # iTunes Lookup API
+│       ├── tidal.js           # Tidal API + Deezer search fallback
+│       └── qobuz.js           # Qobuz API + Deezer search fallback
+│
+└── public/
+    ├── index.html             # Full app: Flexoki theming, glassmorphism, custom dropdowns, responsive
+    ├── app.js                 # Frontend logic: search, format selects, progress ring, SSE, palette
+    ├── boids.js               # Full-screen Reynolds flocking animation with palette theming
+    └── _headers               # Cloudflare Pages edge caching rules
 ```
 
-## How it works
+## How It Works
 
 ### Two download paths
 
-1. **Direct** (yt-dlp sites): URL → metadata → pick format → download → stream.
-2. **Match** (DRM services): URL → read public metadata → find YouTube match → download audio → embed original tags/artwork → stream.
+1. **Direct** (yt-dlp sites): URL → metadata + format list → pick format → background download → SSE progress → stream file → delete from disk
+2. **Match** (DRM services): URL → read public metadata → find best YouTube match → download audio → embed ID3 tags/artwork → SSE progress → stream file
 
-### Endpoints
+### API Endpoints
 
 | Endpoint | Method | Purpose |
-| --- | --- | --- |
-| `/api/info?url=` | GET | Auto-detects the source, resolves metadata + formats or matched tracks |
-| `/api/prepare` | POST | Stashes a download job (single or batch), returns a short-lived token |
-| `/api/download?token=` | GET | Streams a single file or a ZIP archive to the browser, then cleans up |
+|---|---|---|
+| `/api/info?url=` | GET | Auto-detect source, resolve metadata + formats or matched tracks |
+| `/api/prepare` | POST | Stash download job (single/batch), return short-lived token |
+| `/api/download` | POST | Trigger background download, return immediately |
+| `/api/progress/:token` | GET | SSE stream for real-time download progress |
+| `/api/file/:id` | GET | Serve completed download file (temporary, auto-expires) |
+| `/api/health` | GET | Health check (uptime, memory) |
 
-- All downloads are staged in the OS temp dir and **deleted immediately** after streaming — nothing is retained.
-- Download tokens expire after 10 minutes and are single-use.
-- **Playlists/albums/batches** download every selected item and deliver as a single `.zip`.
-- Matched MP3s are tagged with the original service's metadata (title, artist, album, album art) via ID3.
+### Key design decisions
 
-## Project layout
+- **Split architecture** — static frontend on CF Pages (fast global edge), API on VPS (compute-heavy). No CORS issues, no 502 timeouts from serving static assets through the tunnel.
+- **SQLite cache** — every `/api/info` response is cached permanently in a WAL-mode SQLite DB. Repeat lookups return instantly. Auto-pruned at 50K entries / 100MB.
+- **File lifetime** — downloads reside on disk temporarily. Lifetime scales with file size (min 5 min, max 24h). Cleanup job runs every 60s. Disk guard caps total download storage at 2GB.
+- **Rate limiting** — 30 req/min for API, 5 req/min for downloads. IP-based, no X-Forwarded-For header trusted (safe behind CF Tunnel).
+- **Graceful shutdown** — SIGTERM/SIGINT triggers 5s drain window. uncaughtException forces exit(1) for clean PM2 restart. SQLite DB closes on exit event.
+- **PM2** — managed process with 500MB memory limit, 10 max restarts, exponential backoff, log rotation (10MB × 5 files), `@reboot pm2 resurrect` in crontab.
 
+## Frontend Features
+
+- **Flexoki color system** — Steph Ango's inky palette with dark/light theme toggle, persisted to localStorage
+- **Adaptive palette extraction** — server extracts accent/background/surface colors from thumbnails via sharp; frontend applies full themed UI (backgrounds, text, glass cards, dropdowns)
+- **Custom themed dropdowns** — native `<select>` elements replaced with glassmorphism dropdowns, portal'd to body, keyboard-navigable, MutationObserver-synced
+- **Boids background** — full-screen Reynolds flocking animation, palette-themed, responsive (40 boids mobile, 90 desktop), cursor parallax, card avoidance, event-triggered burst/expand
+- **Progress ring** — SVG circular progress with SSE streaming, speed/ETA display, checkmark on completion
+- **Multi-item** — playlist/album support with checkboxes, select-all, batch ZIP download with progress
+- **Responsive** — mobile-first: 44px touch targets, safe-area insets, 16px inputs (no iOS zoom), `@media (hover: hover)` guards
+
+## Deployment
+
+### Frontend (Cloudflare Pages)
+```bash
+export CLOUDFLARE_API_TOKEN="..."
+export CLOUDFLARE_ACCOUNT_ID="..."
+cd /root/grab
+wrangler pages deploy public --project-name=grab-front
 ```
-.
-├── server.js              # Express app: route router + endpoints
-├── package.json
-├── lib/
-│   ├── detect.js          # URL → { type: direct|match, platform }
-│   ├── ytdlp.js           # yt-dlp wrappers (info, list, downloadOne, stream)
-│   ├── archive.js         # batch download → ZIP stream
-│   ├── search.js          # find best YouTube match by ISRC / artist - title
-│   ├── tagging.js         # node-id3 wrapper (embed metadata + art)
-│   └── matchers/
-│       ├── index.js       # routes match sources to resolvers
-│       ├── spotify.js     # Spotify Web API + oEmbed fallback
-│       ├── appleMusic.js  # iTunes Lookup API
-│       ├── tidal.js       # slug + Deezer search
-│       └── qobuz.js       # slug + Deezer search
-└── public/
-    ├── index.html         # Dark, glassy UI (source badges, multi-item list)
-    └── app.js             # Frontend logic (no framework)
+Cache-bust: bump `?v=N` on `<script src>` in `index.html`.
+
+### Backend (VPS)
+```bash
+pm2 start ecosystem.config.cjs
+pm2 save                          # persist across reboots
+crontab -e                         # add: @reboot pm2 resurrect
 ```
 
-## Notes & limitations
-
-- **Personal use only.** Respect creators and each platform's Terms of Service.
-- **Auth-gated content** (Instagram/TikTok/private videos) may require cookies. Pass a cookies file to yt-dlp manually; cookie handling isn't built into the UI.
-- **Match sources deliver YouTube audio**, tagged with the original metadata — not the streaming service's native stream (those are DRM-protected).
-- **Tidal/Qobuz** pages are fully JS-rendered with no server-side metadata, so only track URLs that contain a name slug can be resolved.
-- **Large/4K muxed downloads** take time server-side before the first byte (yt-dlp must download + remux). Browser download progress appears once streaming begins.
-- If downloads fail with ffmpeg errors, set `FFMPEG_LOCATION` to the directory containing your `ffmpeg` binary.
+### Cloudflare Tunnel
+```bash
+cloudflared tunnel run <tunnel-name> &
 ```
+Public hostname `grab-api.msedge.lol` → `http://127.0.0.1:3000`.
+
+### Full setup guide
+See `DEPLOY.md` for step-by-step cross-account CF Pages custom domain setup and `WRANGLER-AUTH.md` for API token creation.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Page reloads to `/?` | JS syntax error or form submits via GET | Check browser console for errors; `onsubmit="return false"` guards at HTML level |
+| 502 on API | Tunnel disconnected or Node crashed | `pm2 status`, `cloudflared tunnel info <name>`, check `/tmp/cloudflared.log` |
+| CORS error in browser | Origin not in ALLOWED_ORIGINS | Add domain to `server.js` ALLOWED_ORIGINS, restart |
+| Downloads fail with ffmpeg error | ffmpeg not found | Set `FFMPEG_LOCATION` env var or install ffmpeg |
+| Old UI after deploy | Cached app.js (immutable header) | Hard-refresh (Ctrl+Shift+R) or bump `?v=N` |
+| yt-dlp fails on YouTube | Missing JS runtime | Ensure Node v22+ or set `YT_DLP_JS_RUNTIME=node` |
+| Instagram/TikTok blocked | Auth required | Place `cookies.txt` (Netscape format) in project root |
+
+## License & Disclaimer
+
+**Personal use only.** Respect creators and each platform's Terms of Service. This tool does not host, store, or distribute copyrighted content — it's a local download manager that wraps yt-dlp and ffmpeg.
