@@ -10,7 +10,10 @@
   },
   "dependencies": {
     "archiver": "^8.0.0",
+    "better-sqlite3": "^12.11.1",
     "express": "^4.19.2",
-    "node-id3": "^0.2.9"
+    "express-rate-limit": "^8.5.2",
+    "node-id3": "^0.2.9",
+    "sharp": "^0.35.2"
   }
 }

@@ -1,0 +1,30 @@
+# ════════════════════════════════════════════════
+# Cloudflare Pages · Edge HTTP headers
+# ════════════════════════════════════════════════
+# Applied by CF at the edge before serving from Pages origin.
+
+# ── Default security / CORS for entire origin ──
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer-when-downgrade
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Cross-Origin-Opener-Policy: same-origin
+
+# ── index.html: never cache so version cache-busts always load fresh ──
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+  Content-Type: text/html; charset=utf-8
+
+# ── app.js: cache aggressively, but the ?v=N query string in <script src>
+#    behaves as a different URL at the edge so cache-busts still work ──
+/app.js
+  Cache-Control: public, max-age=31536000, immutable
+
+# ── boids.js: same cache strategy as app.js ──
+/boids.js
+  Cache-Control: public, max-age=31536000, immutable
+
+# ── favicons / OG / theme assets ──
+/favicon.*
+  Cache-Control: public, max-age=86400

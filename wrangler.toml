@@ -1,0 +1,14 @@
+# ════════════════════════════════════════════════
+# grab · Cloudflare Pages deployment config
+# ════════════════════════════════════════════════
+# Frontend deploys to CF Pages on the *other* Cloudflare account.
+# Backend API stays on this VPS, exposed via Cloudflare Tunnel as
+# `grab-api.msedge.lol`. See DEPLOY.md for the full setup sequence.
+
+name = "grab-front"
+pages_build_output_dir = "./public"
+compatibility_date = "2025-06-25"
+
+# This project has no build step — public/ is shipped as-is.
+# All `?v=N` cache-busts on app.js / index.html bypass any static
+# caching at the edge. See public/_headers for per-route caching.

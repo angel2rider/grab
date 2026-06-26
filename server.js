@@ -18,12 +18,75 @@ import {
 import { downloadZip } from "./lib/archive.js";
 import { tagMp3 } from "./lib/tagging.js";
 import { resolveMatch } from "./lib/matchers/index.js";
+import { cacheGet, cacheSet, cacheStats } from "./lib/cache.js";
+import sharp from "sharp";
+import { rateLimit } from "express-rate-limit";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+
+// ---- Rate Limiting ----
+// Prevent abuse: 30 requests per minute per IP for API endpoints
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please wait a moment." },
+  keyGenerator: (req) => req.ip || req.headers["x-forwarded-for"] || "unknown",
+});
+
+// Stricter limit for download endpoint: 5 per minute
+const downloadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Download rate limit reached. Please wait a moment." },
+  keyGenerator: (req) => req.ip || req.headers["x-forwarded-for"] || "unknown",
+});
+
+// ---- CORS for split-architecture (CF Pages → VPS backend) ----
+// Exact-match origins (production + local dev).
+const ALLOWED_ORIGINS = [
+  "https://grab.msedge.lol",
+  "https://grab-front.pages.dev",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+// Wildcard patterns: any subdomain under these suffixes is allowed.
+// This covers CF Pages preview deployments like e135f010.grab-front.pages.dev.
+const ALLOWED_ORIGIN_PATTERNS = [
+  /^https:\/\/(.+\.)?grab-front\.pages\.dev$/,
+];
+
+function isOriginAllowed(origin) {
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  for (const p of ALLOWED_ORIGIN_PATTERNS) {
+    if (p.test(origin)) return true;
+  }
+  return false;
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  // Always advertise Vary: Origin so edge caches don't serve one origin's
+  // CORS response to a different origin (CDN caching correctness).
+  res.setHeader("Vary", "Origin");
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Max-Age", "86400");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// Still serve static files for local development
 app.use(express.static(join(__dirname, "public"), { maxAge: 0 }));
 
 // ---- persistent downloads directory ----
@@ -81,9 +144,9 @@ function calcAliveTime(fileSizeBytes) {
 function broadcastProgress(token, data) {
   const entry = progressStore.get(token);
   if (!entry) return;
-  // Update stored state
+  // Update stored state (merge so we don't lose fields like fileId / filename)
   Object.assign(entry, data);
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
+  const msg = `event: progress\ndata: ${JSON.stringify(data)}\n\n`;
   for (const client of entry.clients) {
     try { client.write(msg); } catch {}
   }
@@ -93,8 +156,9 @@ function broadcastProgress(token, data) {
       try { client.end(); } catch {}
     }
     entry.clients.clear();
-    // Remove from store after a delay
-    setTimeout(() => progressStore.delete(token), 60_000);
+    // Keep the completed entry around for 5 minutes so late SSE
+    // connections can still get the result (poll-based fallback).
+    setTimeout(() => progressStore.delete(token), 5 * 60_000);
   }
 }
 
@@ -116,6 +180,182 @@ function resolveFormatPreset(formatId, mode) {
 
 function newToken() {
   return randomBytes(9).toString("base64url");
+}
+
+// ---- URL normalization ----
+// Canonicalize URLs before caching so that different share formats,
+// tracking params, and timestamps all resolve to the same cache key.
+//
+// YouTube variants handled:
+//   youtu.be/ID?si=...    → https://www.youtube.com/watch?v=ID
+//   youtube.com/watch?v=ID&list=...&t=42&si=... → https://www.youtube.com/watch?v=ID
+//   m.youtube.com / music.youtube.com / youtube-nocookie.com
+//   youtube.com/embed/ID / youtube.com/v/ID / youtube.com/shorts/ID
+//
+// Non-YouTube URLs: stripping common tracking params and fragments.
+
+function normalizeUrl(raw) {
+  let url = String(raw || "").trim();
+  if (!url) return url;
+
+  // ---- YouTube: extract canonical video-ID URL ----
+  const YT_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+  let videoId = null;
+
+  // youtu.be/ID, you.tube/ID, youtu.be/ID?anything
+  const ytBe = url.match(/^https?:\/\/(?:youtu\.be|you\.tube)\/([A-Za-z0-9_-]{11})/);
+  if (ytBe) videoId = ytBe[1];
+
+  // youtube.com/watch?v=ID, youtube.com/v/ID, youtube.com/shorts/ID, youtube.com/embed/ID
+  if (!videoId) {
+    const ytWatch = url.match(/^https?:\/\/(?:www\.|m\.|music\.|gaming\.|(?:[-\w]+\.))*youtube(?:-nocookie)?\.com\/(?:watch\?v=|v\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/);
+    if (ytWatch) videoId = ytWatch[1];
+  }
+
+  // youtu.be URLs with /embed or /shorts paths
+  if (!videoId) {
+    const ytPath = url.match(/^https?:\/\/(?:www\.|m\.|music\.)*youtube\.com\/(?:embed|shorts|v|live)\/([A-Za-z0-9_-]{11})/);
+    if (ytPath) videoId = ytPath[1];
+  }
+
+  if (videoId) {
+    // Rebuild clean canonical YouTube URL: the gold-standard cache key.
+    // Note: we keep the www. prefix so yt-dlp uses the standard extractor.
+    return `https://www.youtube.com/watch?v=${videoId}`;
+  }
+
+  // ---- Non-YouTube: strip tracking params, timestamps, and fragments ----
+  try {
+    const parsed = new URL(url);
+    // Strip known tracking / share / analytics params (safe to drop).
+    const TRACKING_PARAMS = new Set([
+      "si", "feature", "ref", "source", "utm_source", "utm_medium",
+      "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid",
+      "mc_cid", "mc_eid", "_ga", "_gl", "ref_", "spm", "scm",
+      "wickedid", "yclid", "igshid", "twclid", "list",
+    ]);
+    for (const key of [...parsed.searchParams.keys()]) {
+      const lower = key.toLowerCase();
+      if (TRACKING_PARAMS.has(lower) || lower.startsWith("utm_") || lower.startsWith("ref_")) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    // Strip timestamp if standalone (not for services that need it).
+    // YouTube already handled above, but for other video hosts, keep the
+    // URL clean. We only strip "t" if it's clearly a timestamp (numeric seconds).
+    if (parsed.searchParams.has("t")) {
+      const tVal = parsed.searchParams.get("t");
+      if (/^\d+$/.test(tVal)) parsed.searchParams.delete("t");
+    }
+    if (parsed.searchParams.has("start")) {
+      const sVal = parsed.searchParams.get("start");
+      if (/^\d+$/.test(sVal)) parsed.searchParams.delete("start");
+    }
+    // Strip fragment
+    parsed.hash = "";
+    // Normalize host to lowercase
+    parsed.hostname = parsed.hostname.toLowerCase();
+    // Remove default ports
+    if ((parsed.protocol === "https:" && parsed.port === "443") ||
+        (parsed.protocol === "http:" && parsed.port === "80")) {
+      parsed.port = "";
+    }
+    url = parsed.toString();
+  } catch {
+    // Not a valid URL — return as-is.
+  }
+
+  return url;
+}
+
+// ---- thumbnail color extraction ----
+
+/**
+ * Extract a color palette from a thumbnail image.
+ * Returns { accent, bg, surface } hex strings, or null on failure.
+ *
+ * accent  — most vibrant/saturated color (buttons, links, active states)
+ * bg      — darkest non-black color with some saturation (page background tint)
+ * surface — most common mid-brightness color (glass card tint)
+ */
+async function extractPalette(imageUrl) {
+  if (!imageUrl) return null;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(imageUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const { data, info } = await sharp(buffer)
+      .resize(50, 50, { fit: "cover" })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const channels = info.channels;
+    const allPixels = [];
+    for (let i = 0; i < data.length; i += channels) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const brightness = (r + g + b) / 3;
+      const saturation = Math.max(r, g, b) - Math.min(r, g, b);
+      allPixels.push({ r, g, b, brightness, saturation });
+    }
+
+    if (!allPixels.length) return null;
+
+    const clamp = (v) => Math.min(255, Math.max(0, Math.round(v)));
+    const toHex = (r, g, b) => `#${clamp(r).toString(16).padStart(2, "0")}${clamp(g).toString(16).padStart(2, "0")}${clamp(b).toString(16).padStart(2, "0")}`;
+
+    // ── accent: most vibrant color (favors saturation × population) ──
+    const quantize = (v) => Math.round(v / 32) * 32;
+    const satMap = new Map();
+    for (const p of allPixels) {
+      if (p.brightness < 25 || p.brightness > 230) continue;
+      const key = `${quantize(p.r)},${quantize(p.g)},${quantize(p.b)}`;
+      satMap.set(key, (satMap.get(key) || 0) + p.saturation);
+    }
+    let accentHex = null;
+    if (satMap.size > 0) {
+      let best = null, bestScore = -1;
+      for (const [k, s] of satMap) { if (s > bestScore) { bestScore = s; best = k; } }
+      const [ar, ag, ab] = best.split(",").map(Number);
+      accentHex = toHex(ar, ag, ab);
+    }
+
+    // ── bg: darkest color that still has some character (not pure black) ──
+    // Sort by saturation, pick the dark pixel with most color.
+    const darkPixels = allPixels.filter(p => p.brightness >= 8 && p.brightness <= 80 && p.saturation >= 10);
+    darkPixels.sort((a, b) => b.saturation - a.saturation);
+    let bgHex = null;
+    if (darkPixels.length > 0) {
+      const bg = darkPixels[0];
+      // Darken and desaturate slightly for a background tone
+      const mix = (v, k) => clamp(v * 0.55 + k * 0.45);
+      bgHex = toHex(mix(bg.r, 10), mix(bg.g, 10), mix(bg.b, 10));
+    }
+
+    // ── surface: most common mid-brightness color (for glass card tint) ──
+    const midPixels = allPixels.filter(p => p.brightness >= 30 && p.brightness <= 180 && p.saturation >= 15);
+    const midMap = new Map();
+    for (const p of midPixels) {
+      const key = `${quantize(p.r)},${quantize(p.g)},${quantize(p.b)}`;
+      midMap.set(key, (midMap.get(key) || 0) + 1);
+    }
+    let surfaceHex = null;
+    if (midMap.size > 0) {
+      let best = null, bestCount = -1;
+      for (const [k, c] of midMap) { if (c > bestCount) { bestCount = c; best = k; } }
+      const [sr, sg, sb] = best.split(",").map(Number);
+      surfaceHex = toHex(sr, sg, sb);
+    }
+
+    if (!accentHex) return null;
+    return { accent: accentHex, bg: bgHex, surface: surfaceHex };
+  } catch (e) {
+    console.error("  ▸ palette extraction failed:", e.message || e);
+    return null;
+  }
 }
 
 // ---- helpers for file storage ----
@@ -174,10 +414,29 @@ function runCleanupJob() {
 }
 
 // ---- GET /api/info ----
-app.get("/api/info", async (req, res) => {
-  const url = String(req.query.url || "").trim();
+app.get("/api/info", apiLimiter, async (req, res) => {
+  const url = normalizeUrl(req.query.url);
   if (!isValidUrl(url)) {
     return res.status(400).json({ error: "Please paste a valid video or music link." });
+  }
+
+  // --- check cache first ---
+  const cached = cacheGet(url);
+  if (cached) {
+    console.log(`  ▸ cache hit:  ${url.slice(0, 60)}…`);
+    // Self-heal: if cached entry is missing palette, extract and update cache
+    if (!cached.palette) {
+      const thumbUrl = cached.thumbnail || cached.tracks?.[0]?.artwork;
+      if (thumbUrl) {
+        const palette = await extractPalette(thumbUrl);
+        if (palette) {
+          cached.palette = palette;
+          cached.accentHex = palette.accent;
+          cacheSet(url, cached, { platform: cached.platform || "", kind: cached.kind || "single" });
+        }
+      }
+    }
+    return res.json(cached);
   }
 
   const { type, platform } = detect(url);
@@ -186,7 +445,20 @@ app.get("/api/info", async (req, res) => {
   try {
     if (type === "match") {
       const result = await resolveMatch(platform, url);
-      return res.json({ sourceType: "match", platform, platformMeta, ...result });
+      const resp = { sourceType: "match", platform, platformMeta, ...result };
+
+      // Extract color palette from matched track artwork
+      const artworkUrl = result.tracks?.[0]?.artwork || result.thumbnail;
+      if (artworkUrl) {
+        const palette = await extractPalette(artworkUrl);
+        if (palette) {
+          resp.palette = palette;
+          resp.accentHex = palette.accent;
+        }
+      }
+
+      cacheSet(url, resp, { platform, kind: result.kind || "single" });
+      return res.json(resp);
     }
 
     const info = await listEntries(url);
@@ -197,6 +469,17 @@ app.get("/api/info", async (req, res) => {
       ...info,
     };
     resp.platform = platform;
+
+    // Extract color palette from YouTube thumbnail
+    if (info.thumbnail) {
+      const palette = await extractPalette(info.thumbnail);
+      if (palette) {
+        resp.palette = palette;
+        resp.accentHex = palette.accent;
+      }
+    }
+
+    cacheSet(url, resp, { platform, kind: info.kind || "single" });
     return res.json(resp);
   } catch (e) {
     return res.status(422).json({ error: e.message || "Couldn't resolve this link." });
@@ -204,8 +487,16 @@ app.get("/api/info", async (req, res) => {
 });
 
 // ---- POST /api/prepare : stash a download job, return a token ----
-app.post("/api/prepare", (req, res) => {
+app.post("/api/prepare", apiLimiter, (req, res) => {
   const body = req.body || {};
+  if (body.url) body.url = normalizeUrl(body.url);
+  // Also normalize URLs inside batch items
+  if (Array.isArray(body.items)) {
+    for (const it of body.items) {
+      if (it.url) it.url = normalizeUrl(it.url);
+      if (it.resolvedUrl) it.resolvedUrl = normalizeUrl(it.resolvedUrl);
+    }
+  }
   const { url, items, mode, formatId, isBatch, sourceType, platform } = body;
 
   if (sourceType === "match" && Array.isArray(items) && items.length) {
@@ -262,7 +553,7 @@ app.post("/api/prepare", (req, res) => {
 });
 
 // ---- POST /api/download : trigger background download, return immediately ----
-app.post("/api/download", async (req, res) => {
+app.post("/api/download", downloadLimiter, async (req, res) => {
   const { token } = req.body || {};
   const entry = sessions.get(token);
   if (!entry || Date.now() - entry.createdAt > SESSION_TTL) {
@@ -289,12 +580,12 @@ app.post("/api/download", async (req, res) => {
  */
 async function runBackgroundDownload(token, entry) {
   const fileId = token;
-  broadcastProgress(token, { status: "downloading", percent: 0, step: "Starting…", speed: "", eta: "" });
+  broadcastProgress(token, { status: "starting", percent: 0, step: "Preparing download…", speed: "", eta: "" });
 
   if (entry.kind === "zip") {
     // ZIP batch download
     const items = entry.items;
-    broadcastProgress(token, { status: "downloading", percent: 0, step: `Preparing archive (0/${items.length})…`, speed: "", eta: "" });
+    broadcastProgress(token, { status: "starting", percent: 0, step: `Resolving ${items.length} items…`, speed: "", eta: "" });
 
     try {
       const { filePath, ext } = await downloadZip({
@@ -303,6 +594,16 @@ async function runBackgroundDownload(token, entry) {
         outDir: DOWNLOADS_DIR,
         basename: fileId,
         zipName: entry.zipName,
+        onItemProgress: (idx, total, title) => {
+          const pct = Math.round((idx / total) * 100);
+          broadcastProgress(token, {
+            status: "downloading",
+            percent: pct,
+            step: `Downloading ${idx + 1} of ${total}…`,
+            speed: "", eta: "",
+            detail: title || "",
+          });
+        },
       });
 
       const fileSize = (await stat(filePath)).size;
@@ -317,11 +618,11 @@ async function runBackgroundDownload(token, entry) {
 
       broadcastProgress(token, {
         status: "complete",
-        percent: 100, step: "Complete",
+        percent: 100, step: "Archive ready",
         fileId, downloadUrl: `/api/file/${fileId}`, filename, size: fileSize, aliveMinutes: Math.round(aliveTime / 60000),
       });
     } catch (e) {
-      broadcastProgress(token, { status: "error", error: e.message });
+      broadcastProgress(token, { status: "error", error: e.message, step: "Archive failed" });
     }
     return;
   }
@@ -329,7 +630,7 @@ async function runBackgroundDownload(token, entry) {
   // Single item download with progress callback
   const onProgress = (prog) => {
     broadcastProgress(token, {
-      status: "downloading",
+      status: prog.status || "downloading",
       percent: prog.percent,
       step: prog.step,
       speed: prog.speed || "",
@@ -349,7 +650,7 @@ async function runBackgroundDownload(token, entry) {
 
     // Tag matched audio
     if (ext === "mp3" && entry.meta) {
-      broadcastProgress(token, { status: "downloading", percent: 97, step: "Tagging metadata…", speed: "", eta: "" });
+      broadcastProgress(token, { status: "downloading", percent: 97, step: "Writing metadata tags…", speed: "", eta: "" });
       try {
         await tagMp3(filePath, entry.meta);
       } catch (e) {
@@ -358,6 +659,7 @@ async function runBackgroundDownload(token, entry) {
     }
 
     // Move file to persistent storage
+    broadcastProgress(token, { status: "downloading", percent: 98, step: "Saving file…", speed: "", eta: "" });
     const storedPath = join(DOWNLOADS_DIR, `${fileId}.${ext}`);
     await rename(filePath, storedPath);
     await cleanup(dir);
@@ -374,11 +676,11 @@ async function runBackgroundDownload(token, entry) {
 
     broadcastProgress(token, {
       status: "complete",
-      percent: 100, step: "Complete",
+      percent: 100, step: "Download complete",
       fileId, downloadUrl: `/api/file/${fileId}`, filename, size: fileSize, aliveMinutes: Math.round(aliveTime / 60000),
     });
   } catch (e) {
-    broadcastProgress(token, { status: "error", error: e.message, percent: 0, step: "Failed" });
+    broadcastProgress(token, { status: "error", error: e.message, step: "Download failed" });
   }
 }
 
@@ -400,27 +702,28 @@ app.get("/api/progress/:token", (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
-  // Send current state immediately
+  // Send current state immediately (named event so client can distinguish)
   const currentState = {
     status: entry.status,
     percent: entry.percent,
     step: entry.step,
     speed: entry.speed || "",
     eta: entry.eta || "",
+    detail: entry.detail || "",
   };
-  res.write(`data: ${JSON.stringify(currentState)}\n\n`);
+  res.write(`event: progress\ndata: ${JSON.stringify(currentState)}\n\n`);
 
   // If already in terminal state, close with result data
   if (entry.status === "complete") {
-    res.write(`data: ${JSON.stringify({
-      status: "complete", percent: 100, step: "Complete",
+    res.write(`event: done\ndata: ${JSON.stringify({
+      status: "complete", percent: 100, step: "Download complete",
       fileId: entry.fileId, downloadUrl: entry.downloadUrl,
       filename: entry.filename, size: entry.size, aliveMinutes: entry.aliveMinutes,
     })}\n\n`);
     return res.end();
   }
   if (entry.status === "error") {
-    res.write(`data: ${JSON.stringify({ status: "error", error: entry.error || "Download failed." })}\n\n`);
+    res.write(`event: done\ndata: ${JSON.stringify({ status: "error", error: entry.error || "Download failed.", step: "Download failed" })}\n\n`);
     return res.end();
   }
 
@@ -435,12 +738,12 @@ app.get("/api/progress/:token", (req, res) => {
   // Double-check: still not terminal after registering (race condition guard)
   if (entry.status === "complete" || entry.status === "error") {
     const terminalData = entry.status === "complete"
-      ? { status: "complete", percent: 100, step: "Complete",
+      ? { status: "complete", percent: 100, step: "Download complete",
           fileId: entry.fileId, downloadUrl: entry.downloadUrl,
           filename: entry.filename, size: entry.size, aliveMinutes: entry.aliveMinutes }
-      : { status: "error", error: entry.error || "Download failed." };
+      : { status: "error", error: entry.error || "Download failed.", step: "Download failed" };
     try {
-      res.write(`data: ${JSON.stringify(terminalData)}\n\n`);
+      res.write(`event: done\ndata: ${JSON.stringify(terminalData)}\n\n`);
     } catch {}
     try { res.end(); } catch {}
     clearInterval(hb);
@@ -488,6 +791,14 @@ app.get("/api/file/:id", async (req, res) => {
   });
 });
 
+// ---- global JSON error handler (prevents Express from returning HTML errors) ----
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled error:", err.message || err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: "Internal server error. Please try again." });
+  }
+});
+
 // ---- cleanup interval ----
 setInterval(runCleanupJob, 60_000);
 
@@ -502,5 +813,6 @@ setInterval(() => {
 app.listen(PORT, () => {
   console.log(`\n  ▸ grab running at  http://localhost:${PORT}`);
   console.log(`  ▸ ffmpeg dir:   ${FFMPEG_DIR}`);
-  console.log(`  ▸ downloads:    ${DOWNLOADS_DIR}\n`);
+  console.log(`  ▸ downloads:    ${DOWNLOADS_DIR}`);
+  console.log(`  ▸ cache:        ${cacheStats().entries} entries\n`);
 });

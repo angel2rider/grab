@@ -1,5 +1,8 @@
 node_modules/
 downloads/
+data/
 .env
 .DS_Store
 *.log
+cookies.txt
+WRANGLER-AUTH.md
