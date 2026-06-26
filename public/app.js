@@ -6,6 +6,310 @@ const API_BASE = location.hostname === 'localhost' || location.hostname === '127
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
+
+// ═══════════════════════════════════════════════
+//  CUSTOM DROPDOWN · replaces native <select>
+// ═══════════════════════════════════════════════
+const customSelects = new Map();
+let _csBackdrop = null;
+let _csOpen = null;
+
+function ensureBackdrop() {
+  if (!_csBackdrop) {
+    _csBackdrop = document.createElement("div");
+    _csBackdrop.className = "custom-select-backdrop";
+    document.body.appendChild(_csBackdrop);
+    _csBackdrop.addEventListener("click", () => {
+      if (_csOpen) _csOpen.close();
+    });
+  }
+  return _csBackdrop;
+}
+
+class CustomSelect {
+  constructor(nativeSel) {
+    this.native = nativeSel;
+    this.wrapper = nativeSel.closest(".select");
+    this.id = nativeSel.id || "";
+
+    // Build custom UI
+    this.trigger = document.createElement("button");
+    this.trigger.type = "button";
+    this.trigger.className = "custom-select-trigger";
+    this.trigger.innerHTML = `
+      <span class="custom-select-label"></span>
+      <svg class="custom-select-chevron" viewBox="0 0 10 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M1 1l4 4 4-4" />
+      </svg>`;
+    this.label = this.trigger.querySelector(".custom-select-label");
+
+    // Mark native as custom-controlled
+    nativeSel.classList.add("custom-select-native");
+
+    // Insert trigger before native select
+    this.wrapper.insertBefore(this.trigger, nativeSel);
+    this.wrapper.classList.add("custom-select");
+
+    // Build dropdown panel (appended to body for fixed positioning)
+    this.dropdown = document.createElement("div");
+    this.dropdown.className = "custom-select-dropdown";
+    document.body.appendChild(this.dropdown);
+
+    // Event listeners
+    this._onTriggerClick = this._onTriggerClick.bind(this);
+    this._onKeyDown = this._onKeyDown.bind(this);
+    this._onScroll = this._onScroll.bind(this);
+    this._onNativeChange = this._onNativeChange.bind(this);
+    this.trigger.addEventListener("click", this._onTriggerClick);
+    this.trigger.addEventListener("keydown", this._onKeyDown);
+    this.native.addEventListener("change", this._onNativeChange);
+
+    // Track whether we just opened (for entry animation vs. scroll reposition)
+    this._justOpened = false;
+
+    // Watch for option mutations (populate functions)
+    this._observer = new MutationObserver(() => {
+      queueMicrotask(() => this._rebuildOptions());
+    });
+    this._observer.observe(this.native, { childList: true, subtree: true });
+
+    // Initial sync
+    this._rebuildOptions();
+
+    customSelects.set(nativeSel, this);
+  }
+
+  _rebuildOptions() {
+    this.dropdown.innerHTML = "";
+    const selIdx = this.native.selectedIndex;
+    for (let i = 0; i < this.native.options.length; i++) {
+      const opt = this.native.options[i];
+      const div = document.createElement("div");
+      div.className = "custom-select-option" + (i === selIdx ? " active" : "");
+      div.innerHTML = `
+        <span class="opt-check">
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 6l3 3 5-6" />
+          </svg>
+        </span>
+        <span>${escapeHtml(opt.textContent)}</span>`;
+      div.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._selectIndex(i);
+      });
+      this.dropdown.appendChild(div);
+    }
+    this._syncLabel();
+  }
+
+  _syncLabel() {
+    const idx = this.native.selectedIndex;
+    if (idx >= 0 && this.native.options[idx]) {
+      this.label.textContent = this.native.options[idx].textContent;
+    } else {
+      this.label.textContent = "";
+    }
+  }
+
+  _selectIndex(i) {
+    if (i < 0 || i >= this.native.options.length) return;
+    this.native.selectedIndex = i;
+    this._syncLabel();
+    // Update active state in dropdown
+    const opts = this.dropdown.querySelectorAll(".custom-select-option");
+    opts.forEach((el, j) => el.classList.toggle("active", j === i));
+    // Dispatch change event so existing listeners fire
+    this.native.dispatchEvent(new Event("change", { bubbles: true }));
+    this.close();
+  }
+
+  _onNativeChange() {
+    this._syncLabel();
+    // Update active in dropdown
+    const idx = this.native.selectedIndex;
+    const opts = this.dropdown.querySelectorAll(".custom-select-option");
+    opts.forEach((el, j) => el.classList.toggle("active", j === idx));
+  }
+
+  _onTriggerClick(e) {
+    e.preventDefault();
+    if (this.isOpen) {
+      this.close();
+    } else {
+      this.open();
+    }
+  }
+
+  _onKeyDown(e) {
+    // Prevent double-handling: trigger keydown fires + bubbles to document listener.
+    // When dropdown is open, let only the document handler handle key events.
+    if (e.currentTarget === this.trigger && this.isOpen) return;
+
+    if (e.key === "Escape") {
+      this.close();
+      this.trigger.focus();
+      return;
+    }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!this.isOpen) this.open();
+      const dir = e.key === "ArrowDown" ? 1 : -1;
+      let idx = this.native.selectedIndex + dir;
+      if (idx < 0) idx = this.native.options.length - 1;
+      if (idx >= this.native.options.length) idx = 0;
+      this.native.selectedIndex = idx;
+      this._syncLabel();
+      this.native.dispatchEvent(new Event("change", { bubbles: true }));
+      // Update dropdown active
+      const opts = this.dropdown.querySelectorAll(".custom-select-option");
+      opts.forEach((el, j) => el.classList.toggle("active", j === idx));
+      // Scroll selected into view
+      if (opts[idx]) opts[idx].scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (this.isOpen) {
+        this._selectIndex(this.native.selectedIndex);
+      } else {
+        this.open();
+      }
+    }
+  }
+
+  open() {
+    if (this.isOpen) return;
+    // Close any other open dropdown
+    if (_csOpen && _csOpen !== this) _csOpen.close();
+    _csOpen = this;
+
+    // Measure and position FIRST (before making visible) so we can read real offsetHeight
+    this._justOpened = true;
+    this._position();
+
+    this.wrapper.classList.add("open");
+    this.dropdown.classList.add("open");
+    ensureBackdrop().classList.add("active");
+
+    document.addEventListener("keydown", this._onKeyDown);
+    window.addEventListener("scroll", this._onScroll, { passive: true, capture: true });
+    window.addEventListener("resize", this._onScroll, { passive: true });
+  }
+
+  close() {
+    if (!this.isOpen) return;
+    _csOpen = null;
+
+    this.wrapper.classList.remove("open");
+    this.dropdown.classList.remove("open");
+    ensureBackdrop().classList.remove("active");
+
+    document.removeEventListener("keydown", this._onKeyDown);
+    window.removeEventListener("scroll", this._onScroll, { capture: true });
+    window.removeEventListener("resize", this._onScroll);
+  }
+
+  get isOpen() {
+    return this.dropdown.classList.contains("open");
+  }
+
+  _position() {
+    const rect = this.trigger.getBoundingClientRect();
+    if (!rect.width || !rect.height) return; // trigger hidden (e.g. display:none)
+
+    // offsetHeight is unaffected by opacity/transform — returns layout height
+    const ddHeight = Math.min(this.dropdown.offsetHeight, window.innerHeight - 16);
+
+    // Clamp width and left to keep dropdown within viewport
+    const maxW = window.innerWidth - 8;
+    const w = Math.min(Math.max(rect.width, 120), maxW);
+    let left = rect.left;
+    if (left + w > window.innerWidth - 4) left = window.innerWidth - w - 4;
+    if (left < 4) left = 4;
+
+    this.dropdown.style.width = `${w}px`;
+    this.dropdown.style.left = `${left}px`;
+
+    // Decide vertical direction: prefer below, but go above if not enough room
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceAbove = rect.top;
+    const margin = 8;
+    const openUp = spaceBelow < ddHeight + margin && spaceAbove > spaceBelow;
+
+    let top;
+    if (openUp) {
+      top = rect.top - ddHeight - 4;
+      if (top < 4) top = 4;
+      this.dropdown.style.top = `${top}px`;
+      this.dropdown.style.transformOrigin = "bottom center";
+    } else {
+      top = rect.bottom + 4;
+      if (top + ddHeight > window.innerHeight - 4) {
+        top = window.innerHeight - ddHeight - 4;
+        if (top < 4) top = 4;
+      }
+      this.dropdown.style.top = `${top}px`;
+      this.dropdown.style.transformOrigin = "top center";
+    }
+
+    // Entry animation — only on first open; scroll reposition uses CSS transition alone
+    this.dropdown.style.transition = this._justOpened ? "none" : "";
+    this.dropdown.style.transform = this._justOpened
+      ? (openUp ? "scale(0.92) translateY(4px)" : "scale(0.92) translateY(-4px)")
+      : "scale(1) translateY(0)";
+    if (this._justOpened) {
+      void this.dropdown.offsetHeight; // force layout to paint starting state
+      this.dropdown.style.transition = "";
+      this.dropdown.style.transform = "scale(1) translateY(0)";
+      this._justOpened = false;
+    }
+
+    // Scroll selected option into view
+    const active = this.dropdown.querySelector(".custom-select-option.active");
+    if (active) {
+      active.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  _onScroll() {
+    if (this.isOpen) this._position();
+  }
+
+  // Call after populating options programmatically
+  refresh() {
+    this._rebuildOptions();
+    this._syncLabel();
+  }
+
+  destroy() {
+    this.close();
+    this._observer.disconnect();
+    this.trigger.removeEventListener("click", this._onTriggerClick);
+    this.trigger.removeEventListener("keydown", this._onKeyDown);
+    this.native.removeEventListener("change", this._onNativeChange);
+    this.native.classList.remove("custom-select-native");
+    this.wrapper.classList.remove("custom-select", "open");
+    if (this.trigger.parentNode) this.trigger.remove();
+    if (this.dropdown.parentNode) this.dropdown.remove();
+    customSelects.delete(this.native);
+  }
+}
+
+// Initialize all .select select elements on the page
+function initCustomSelects(scope) {
+  const root = scope || document;
+  root.querySelectorAll(".select select:not(.custom-select-native)").forEach((sel) => {
+    new CustomSelect(sel);
+  });
+}
+
+// Clean up all custom select instances (call before replacing result HTML)
+function destroyCustomSelects() {
+  for (const [native, cs] of customSelects) {
+    cs.destroy();
+  }
+  customSelects.clear();
+}
 const form = $("#searchForm");
 const urlInput = $("#urlInput");
 let goBtn = $("#goBtn");
@@ -29,6 +333,9 @@ const html = document.documentElement;
 const savedTheme = localStorage.getItem("grab-theme") || "dark";
 html.setAttribute("data-theme", savedTheme);
 
+// Sync theme-color meta on initial load
+updateThemeColorMeta();
+
 themeToggle.addEventListener("click", () => {
   const next = html.getAttribute("data-theme") === "dark" ? "light" : "dark";
   html.setAttribute("data-theme", next);
@@ -41,7 +348,21 @@ themeToggle.addEventListener("click", () => {
   } else {
     clearInlineTheme();
   }
+  // Update theme-color meta for mobile browser chrome
+  updateThemeColorMeta();
 });
+
+// ─── Update theme-color meta tag to match current background ───
+function updateThemeColorMeta() {
+  const style = getComputedStyle(document.documentElement);
+  const bg = style.getPropertyValue('--bg').trim();
+  // Remove any existing static theme-color metas (they have media queries that may not match)
+  document.querySelectorAll('meta[name="theme-color"]').forEach(m => m.remove());
+  const meta = document.createElement('meta');
+  meta.name = 'theme-color';
+  meta.content = bg || '#1C1B1A';
+  document.head.appendChild(meta);
+}
 
 // ─── Clear inline theme variables (restore stylesheet defaults) ──
 function clearInlineTheme() {
@@ -49,7 +370,8 @@ function clearInlineTheme() {
   const s = document.documentElement.style;
   const vars = ['--accent','--accent-h','--accent-bg','--accent-glow',
     '--bg','--bg-2','--bg-3','--glass-bg','--glass-border',
-    '--input-bg','--seg-bg','--seg-active','--scrollbar'];
+    '--input-bg','--seg-bg','--seg-active','--scrollbar',
+    '--text','--text-2','--muted','--dim'];
   for (const v of vars) s.removeProperty(v);
 }
 
@@ -78,8 +400,19 @@ function applyAccentColors(palette) {
   s.setProperty('--accent-h', `rgb(${darken(ar)},${darken(ag)},${darken(ab)})`);
   s.setProperty('--accent-bg', `rgba(${ar},${ag},${ab},0.10)`);
 
+  // Helper: mix c1 and c2 with ratio (0–1). ratio=1 → 100% c1, ratio=0 → 100% c2
+  const mix = (c1, c2, t) => Math.round(c1 * t + c2 * (1 - t));
+
   if (isDark) {
-    // ── DARK MODE: full background tint from palette ──
+    // ── DARK MODE: full background + text tint from palette ──
+
+    // Text: mix accent with white → near-white tinted, visible on dark bg
+    const W = 255;
+    s.setProperty('--text',   `rgb(${mix(W,ar,0.92)},${mix(W,ag,0.92)},${mix(W,ab,0.92)})`);
+    s.setProperty('--text-2', `rgb(${mix(W,ar,0.80)},${mix(W,ag,0.80)},${mix(W,ab,0.80)})`);
+    s.setProperty('--muted',  `rgb(${mix(W,ar,0.60)},${mix(W,ag,0.60)},${mix(W,ab,0.60)})`);
+    s.setProperty('--dim',    `rgb(${mix(W,ar,0.45)},${mix(W,ag,0.45)},${mix(W,ab,0.45)})`);
+
     s.setProperty('--accent-glow', `rgba(${ar},${ag},${ab},0.16)`);
     if (bg) {
       const [br, bgg, bb] = parse(bg);
@@ -105,7 +438,15 @@ function applyAccentColors(palette) {
       s.setProperty('--scrollbar', `rgba(${ar},${ag},${ab},0.12)`);
     }
   } else {
-    // ── LIGHT MODE: keep paper-white base, tint elements subtly with accent ──
+    // ── LIGHT MODE: dark text from accent, keep paper-white base ──
+
+    // Text: mix accent with black → near-black tinted, readable on light bg
+    const B = 0;
+    s.setProperty('--text',   `rgb(${mix(B,ar,0.92)},${mix(B,ag,0.92)},${mix(B,ab,0.92)})`);
+    s.setProperty('--text-2', `rgb(${mix(B,ar,0.80)},${mix(B,ag,0.80)},${mix(B,ab,0.80)})`);
+    s.setProperty('--muted',  `rgb(${mix(B,ar,0.60)},${mix(B,ag,0.60)},${mix(B,ab,0.60)})`);
+    s.setProperty('--dim',    `rgb(${mix(B,ar,0.45)},${mix(B,ag,0.45)},${mix(B,ab,0.45)})`);
+
     s.setProperty('--accent-glow', `rgba(${ar},${ag},${ab},0.20)`);
     // Clear bg overrides (restore stylesheet paper-white)
     s.removeProperty('--bg');
@@ -120,6 +461,9 @@ function applyAccentColors(palette) {
     s.setProperty('--seg-active', `rgba(255,252,240,0.75)`);
     s.setProperty('--scrollbar', `rgba(${ar},${ag},${ab},0.10)`);
   }
+
+  // Update theme-color meta to match the new background
+  updateThemeColorMeta();
 }
 
 // ─── helpers ───
@@ -227,6 +571,7 @@ form.addEventListener("submit", async (e) => {
 });
 
 function renderSkeleton() {
+  destroyCustomSelects();
   resultEl.innerHTML = `
     <div class="skeleton">
       <div class="skel skel-line"></div>
@@ -295,6 +640,7 @@ function moveBtnToWrap() {
 }
 
 function renderSingle(data) {
+  destroyCustomSelects();
   currentData = data;
   currentMode = data.isAudioOnly ? "audio" : "video";
   selected = { formatId: null, label: "Best available", size: null, height: null, codec: null };
@@ -400,6 +746,9 @@ function renderSingle(data) {
     slot.appendChild(goBtn);
     grabBtnWrap.style.display = "none";
   }
+
+  // Initialize custom selects on the newly rendered elements
+  initCustomSelects(resultEl);
 }
 
 // ─── cascading format selects ───
@@ -878,6 +1227,7 @@ function renderMulti(data) {
   moveBtnToWrap();
   if (heroSection) heroSection.classList.add("has-results");
 
+  destroyCustomSelects();
   resultEl.innerHTML = `
     <div class="card">
       <div class="multi-head">
@@ -1027,4 +1377,7 @@ function renderMulti(data) {
       zipBtn.innerHTML = orig;
     }
   });
+
+  // Initialize custom selects on the newly rendered elements
+  initCustomSelects(resultEl);
 }

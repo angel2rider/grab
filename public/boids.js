@@ -9,9 +9,15 @@
 
   const ctx = canvas.getContext("2d");
 
-  // ── config ──
-  const BOID_COUNT = 90;
-  const RADIUS = 3;
+  // ── config (responsive — recalculated on resize) ──
+  let BOID_COUNT, CONNECTION_DIST, RADIUS;
+  function recalcConfig() {
+    const m = window.innerWidth < 768;
+    BOID_COUNT = m ? 40 : 90;
+    CONNECTION_DIST = m ? 0 : 100;
+    RADIUS = m ? 2.5 : 3;
+  }
+  recalcConfig();
   const MAX_SPEED = 1.4;
   const MIN_SPEED = 0.6;
   const COHESION_WEIGHT = 0.0016;
@@ -59,6 +65,8 @@
       y: Math.random() * H,
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed,
+      colorType: Math.random() < 0.55 ? 'accent' : 'bg',
+      trail: [],
     };
   }
 
@@ -184,59 +192,78 @@
         b.vx = (b.vx / spd) * clamped;
         b.vy = (b.vy / spd) * clamped;
       }
+      // Trail: push current position (before moving)
+      b.trail.push({ x: b.x, y: b.y });
+      if (b.trail.length > 6) b.trail.shift();
+
       b.x += b.vx;
       b.y += b.vy;
-      if (b.x < -30) b.x = W + 30;
-      if (b.x > W + 30) b.x = -30;
-      if (b.y < -30) b.y = H + 30;
-      if (b.y > H + 30) b.y = -30;
+      if (b.x < -30) { b.x = W + 30; b.trail = []; }
+      if (b.x > W + 30) { b.x = -30; b.trail = []; }
+      if (b.y < -30) { b.y = H + 30; b.trail = []; }
+      if (b.y > H + 30) { b.y = -30; b.trail = []; }
     }
   }
 
-  // Read the current accent color from CSS for themed boids (cached, refreshed on theme change)
+  // Read current palette colors from CSS for themed boids (cached, refreshed on change)
   let cachedAccentRGB = null;
-  function refreshAccentRGB() {
+  let cachedBGRGB = null;
+
+  function refreshColors() {
     const style = getComputedStyle(document.documentElement);
-    const hex = style.getPropertyValue('--accent').trim();
-    if (hex && /^#[0-9a-fA-F]{6}$/.test(hex)) {
-      const r = parseInt(hex.slice(1, 3), 16);
-      const g = parseInt(hex.slice(3, 5), 16);
-      const b = parseInt(hex.slice(5, 7), 16);
-      cachedAccentRGB = `${r}, ${g}, ${b}`;
+    // ── accent ──
+    const aHex = style.getPropertyValue('--accent').trim();
+    if (aHex && /^#[0-9a-fA-F]{6}$/.test(aHex)) {
+      cachedAccentRGB = `${parseInt(aHex.slice(1,3),16)}, ${parseInt(aHex.slice(3,5),16)}, ${parseInt(aHex.slice(5,7),16)}`;
     } else {
-      cachedAccentRGB = "45, 165, 85"; // fallback green
+      cachedAccentRGB = "45, 165, 85";
+    }
+    // ── bg (darken and desaturate for subtle boid tone) ──
+    const bgHex = style.getPropertyValue('--bg').trim();
+    if (bgHex && /^#[0-9a-fA-F]{6}$/.test(bgHex)) {
+      const r = parseInt(bgHex.slice(1,3),16), g = parseInt(bgHex.slice(3,5),16), b = parseInt(bgHex.slice(5,7),16);
+      // Darken and blend toward neutral for background boid tone
+      const mix = 0.65;
+      cachedBGRGB = `${Math.round(r*mix + 20*(1-mix))}, ${Math.round(g*mix + 18*(1-mix))}, ${Math.round(b*mix + 16*(1-mix))}`;
+    } else {
+      cachedBGRGB = "28, 38, 32"; // fallback dark greenish
     }
   }
-  refreshAccentRGB();
+  refreshColors();
 
-  // Watch for theme changes to recompute accent color
-  const themeObserver = new MutationObserver(() => {
-    refreshAccentRGB();
-  });
-  themeObserver.observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["data-theme"],
-  });
-  // Also watch for accent CSS variable changes (from applyAccentColors)
-  const styleObserver = new MutationObserver(() => {
-    refreshAccentRGB();
-  });
-  styleObserver.observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["style"],
-  });
+  const attrObserver = new MutationObserver(refreshColors);
+  attrObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "style"] });
 
   function draw() {
     ctx.clearRect(0, 0, W, H);
     const isDark = document.documentElement.getAttribute("data-theme") !== "light";
-    const baseColor = cachedAccentRGB;
-    const boidAlpha = isDark ? 0.55 : 0.32;
+    const accentAlpha = isDark ? 0.55 : 0.35;
+    const bgAlpha = isDark ? 0.35 : 0.22;
 
     for (const b of boids) {
+      const isAccent = b.colorType === 'accent';
+      const color = isAccent ? cachedAccentRGB : cachedBGRGB;
+      const baseAlpha = isAccent ? accentAlpha : bgAlpha;
+
+      // ── trail: fading dots behind the boid ──
+      const trailLen = b.trail.length;
+      if (trailLen > 0) {
+        const trailBaseAlpha = baseAlpha * 0.22;
+        for (let t = 0; t < trailLen; t++) {
+          const p = b.trail[t];
+          const fade = (t + 1) / trailLen; // oldest = faintest (linear fade)
+          const trailAlpha = trailBaseAlpha * fade;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, RADIUS * 0.8, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${color}, ${trailAlpha})`;
+          ctx.fill();
+        }
+      }
+
       const angle = Math.atan2(b.vy, b.vx);
       const speed = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
       const speedRatio = Math.min(1, (speed - MIN_SPEED) / (MAX_SPEED - MIN_SPEED));
-      const alpha = boidAlpha * (0.5 + speedRatio * 0.5);
+      const alpha = baseAlpha * (0.5 + speedRatio * 0.5);
 
       ctx.save();
       ctx.translate(b.x, b.y);
@@ -248,35 +275,36 @@
       ctx.lineTo(-r * 0.6, 0);
       ctx.lineTo(-r * 1.1, r * 0.7);
       ctx.closePath();
-      ctx.fillStyle = `rgba(${baseColor}, ${alpha})`;
+      ctx.fillStyle = `rgba(${color}, ${alpha})`;
       ctx.fill();
-      ctx.strokeStyle = `rgba(${baseColor}, ${alpha * 0.4})`;
+      ctx.strokeStyle = `rgba(${color}, ${alpha * 0.35})`;
       ctx.lineWidth = 0.5;
       ctx.stroke();
       ctx.restore();
     }
 
-    // Connection lines (faint)
-    const connAlpha = isDark ? 0.05 : 0.03;
-    ctx.strokeStyle = `rgba(${baseColor}, ${connAlpha})`;
-    ctx.lineWidth = 0.4;
-    const connDist = 100;
-    ctx.save();
-    for (let i = 0; i < boids.length; i++) {
-      for (let j = i + 1; j < boids.length; j++) {
-        const dx = boids[i].x - boids[j].x;
-        const dy = boids[i].y - boids[j].y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < connDist) {
-          ctx.globalAlpha = 1 - dist / connDist;
-          ctx.beginPath();
-          ctx.moveTo(boids[i].x, boids[i].y);
-          ctx.lineTo(boids[j].x, boids[j].y);
-          ctx.stroke();
+    // Connection lines (faint, accent color only) — disabled on mobile for perf
+    if (CONNECTION_DIST > 0) {
+      const connAlpha = isDark ? 0.04 : 0.025;
+      ctx.strokeStyle = `rgba(${cachedAccentRGB}, ${connAlpha})`;
+      ctx.lineWidth = 0.4;
+      ctx.save();
+      for (let i = 0; i < boids.length; i++) {
+        for (let j = i + 1; j < boids.length; j++) {
+          const dx = boids[i].x - boids[j].x;
+          const dy = boids[i].y - boids[j].y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < CONNECTION_DIST) {
+            ctx.globalAlpha = 1 - dist / CONNECTION_DIST;
+            ctx.beginPath();
+            ctx.moveTo(boids[i].x, boids[i].y);
+            ctx.lineTo(boids[j].x, boids[j].y);
+            ctx.stroke();
+          }
         }
       }
+      ctx.restore();
     }
-    ctx.restore();
   }
 
   function loop() {
@@ -303,7 +331,13 @@
   }
 
   // Recalculate card bounds on resize/scroll only (not every frame)
-  window.addEventListener("resize", resize);
+  window.addEventListener("resize", () => {
+    const prevCount = BOID_COUNT;
+    recalcConfig();
+    resize();
+    // If boid count changed, re-init
+    if (BOID_COUNT !== prevCount) initBoids();
+  });
   window.addEventListener("scroll", updateCardRect, { passive: true });
   // Also update on DOM mutations (card appears after search)
   if (window.MutationObserver) {

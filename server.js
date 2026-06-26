@@ -18,7 +18,7 @@ import {
 import { downloadZip } from "./lib/archive.js";
 import { tagMp3 } from "./lib/tagging.js";
 import { resolveMatch } from "./lib/matchers/index.js";
-import { cacheGet, cacheSet, cacheStats } from "./lib/cache.js";
+import { cacheGet, cacheSet, cacheStats, cacheEnforceLimit } from "./lib/cache.js";
 import sharp from "sharp";
 import { rateLimit } from "express-rate-limit";
 
@@ -36,7 +36,7 @@ const apiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests. Please wait a moment." },
-  keyGenerator: (req) => req.ip || req.headers["x-forwarded-for"] || "unknown",
+  validate: { xForwardedForHeader: false },
 });
 
 // Stricter limit for download endpoint: 5 per minute
@@ -46,7 +46,7 @@ const downloadLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Download rate limit reached. Please wait a moment." },
-  keyGenerator: (req) => req.ip || req.headers["x-forwarded-for"] || "unknown",
+  validate: { xForwardedForHeader: false },
 });
 
 // ---- CORS for split-architecture (CF Pages → VPS backend) ----
@@ -104,13 +104,13 @@ function resolveFfmpegDir() {
       .toString()
       .trim();
   } catch {}
-  for (const c of [fromEnv, fromPath, "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"].filter(Boolean)) {
+  for (const c of [fromEnv, fromPath, "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"].filter(Boolean)) {
     try {
       statSync(c);
       return dirname(c);
     } catch {}
   }
-  return "/opt/homebrew/bin";
+  return "/usr/bin";
 }
 const FFMPEG_DIR = resolveFfmpegDir();
 
@@ -801,6 +801,8 @@ app.use((err, _req, res, _next) => {
 
 // ---- cleanup interval ----
 setInterval(runCleanupJob, 60_000);
+setInterval(cacheEnforceLimit, 15 * 60_000); // cache pruning every 15 min
+cacheEnforceLimit();
 
 // ---- session token cleanup ----
 setInterval(() => {
@@ -809,6 +811,71 @@ setInterval(() => {
     if (now - v.createdAt > SESSION_TTL) sessions.delete(k);
   }
 }, 60_000);
+
+// ---- health check ----
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", uptime: process.uptime(), memory: process.memoryUsage().rss });
+});
+
+// ---- global uncaught error handlers (log then exit — PM2 restarts) ----
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err.message || err);
+  console.error(err.stack);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason?.message || reason);
+});
+
+// ---- graceful shutdown (5s drain, DB closed via exit event in cache.js) ----
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n  ▸ ${signal} received — shutting down…`);
+  // Give active connections 5 seconds to finish
+  setTimeout(() => process.exit(0), 5000);
+}
+["SIGTERM", "SIGINT"].forEach(s => process.on(s, () => gracefulShutdown(s)));
+
+// ---- disk space protection: enforce max downloads dir size (2 GB) ----
+const MAX_DOWNLOADS_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
+function enforceDiskLimit() {
+  try {
+    const files = readdirSync(DOWNLOADS_DIR);
+    let totalSize = 0;
+    const fileStats = [];
+    for (const f of files) {
+      if (f.endsWith(".meta.json")) continue; // handled as side-effect of data file deletion
+      const fp = join(DOWNLOADS_DIR, f);
+      try {
+        const st = statSync(fp);
+        totalSize += st.size;
+        fileStats.push({ path: fp, size: st.size, mtime: st.mtimeMs });
+      } catch {}
+    }
+    if (totalSize > MAX_DOWNLOADS_SIZE) {
+      // Delete oldest files first until under limit, also clean .meta.json
+      fileStats.sort((a, b) => a.mtime - b.mtime);
+      for (const f of fileStats) {
+        try {
+          unlinkSync(f.path);
+          totalSize -= f.size;
+          // Clean orphaned .meta.json
+          const base = f.path.replace(/\.[^.]+$/, "");
+          const metaPath = base + ".meta.json";
+          if (existsSync(metaPath)) unlinkSync(metaPath);
+        } catch {}
+        if (totalSize <= MAX_DOWNLOADS_SIZE * 0.8) break;
+      }
+      console.log(`  ▸ disk guard: cleaned downloads (${(totalSize/1e6).toFixed(0)}MB remaining)`);
+    }
+  } catch (e) {
+    console.error("disk guard error:", e.message);
+  }
+}
+setInterval(enforceDiskLimit, 5 * 60_000); // every 5 min
+enforceDiskLimit();
 
 app.listen(PORT, () => {
   console.log(`\n  ▸ grab running at  http://localhost:${PORT}`);
